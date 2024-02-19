@@ -1,0 +1,10 @@
+sdk-version: 2.8.1
+name: Marbles
+source: daml
+init-script: Setup:setupUsers
+version: 0.0.1
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+sandbox-options: []

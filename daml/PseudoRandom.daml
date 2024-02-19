@@ -1,0 +1,35 @@
+module PseudoRandom where
+
+-- https://en.wikipedia.org/wiki/Linear_congruential_generator
+data Prng = Prng with
+  modulus, multiplier, increment, seed : Int
+    deriving (Eq, Show)
+
+-- The same parameters as glibc (used by GCC), as shown in the Wikipedia link
+-- above.
+defaultPrng : Int -> Prng
+defaultPrng seed = Prng with
+  modulus    = 2 ^ 31
+  multiplier = 1103515245
+  increment  = 12345
+  seed
+
+class Random a where
+  next : Prng -> (Prng, a)
+
+randomInt : Prng -> Int
+randomInt Prng{..} = (multiplier * seed + increment) % modulus
+
+instance Random Int where
+  next prng =
+    let seed = randomInt prng in
+    ((prng with seed), seed)
+
+-- Create many random values. Returns None in case of a negative input.
+nextMany : Random a => Prng -> Int -> Optional (Prng, [a])
+nextMany prng 0 = Some (prng, [])
+nextMany prng n
+  | n < 0     = None
+  | otherwise =
+    let (prng', rand) = next prng in
+    fmap (rand ::) <$> nextMany prng' (n - 1)

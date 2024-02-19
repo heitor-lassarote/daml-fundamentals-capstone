@@ -1,0 +1,137 @@
+module Setup where
+
+import Main
+import PseudoRandom
+
+import Daml.Script
+  ( Script, PartyIdHint (..), User (..), UserRight (..), allocatePartyWithHint
+  , createCmd, createUser, exerciseCmd, queryContractId, submitMulti
+  , validateUserId )
+
+-- Cache some things related to an account for convenience.
+data PartyDetails = PartyDetails with
+  party : Party
+  accId : ContractId Account
+  serviceId : ContractId MarbleWebsiteService
+
+data TestParties partyDetails = TestParties with
+  admin : Party
+  -- There is no such thing as a "main user" in reality, this is just meant to
+  -- be the user most active in test scenarios and in the Navigator, for
+  -- convenience.
+  mainUser : partyDetails
+  otherUsers : [partyDetails]
+
+data TestScenario partyDetails = TestScenario with
+  testParties : TestParties partyDetails
+  prng : Prng
+
+-- Create 4 parties for use in tests, as well as the admin.
+setupTestParties : Script (TestParties Party) = do
+  admin <- allocatePartyWithHint "Digital Marble Racing" (PartyIdHint "Admin")
+  mainUser <- allocatePartyWithHint "Alice" (PartyIdHint "User 1")
+  otherUsers <- mapA
+    (\(name, idx) -> allocatePartyWithHint
+      name
+      (PartyIdHint ("User " <> show idx)))
+    (zip ["Bob", "Carlos Alberto", "Daniella"] [2 .. 4])
+  pure TestParties{..}
+
+-- Helper function to create multiple accounts, given a PRNG, the admin and all
+-- user parties with their usernames.
+createAccounts
+  : Prng -> Party -> [(Party, Text)] -> Script (Prng, [PartyDetails])
+createAccounts prng _     []              = pure (prng, [])
+createAccounts prng admin (user :: users) = do
+  userAccountCreator <- submitMulti [admin, user._1] [] do
+    createCmd MarbleWebsiteService with admin; user = user._1
+  (prng', userAcc) <- submit user._1 do
+    exerciseCmd userAccountCreator CreateAccount with userName = user._2; prng
+  (prng'', otherAccounts) <- createAccounts prng' admin users
+  pure
+    ( prng''
+    , (PartyDetails with
+        party = fst user; accId = userAcc; serviceId = userAccountCreator)
+      :: otherAccounts )
+
+-- Sets up all parties (setupTestParties) as well as their Accounts. Initializes
+-- the PRNG with a dummy seed.
+setupAccountsAndPrng : Script (TestScenario PartyDetails) = do
+  testParties@TestParties{..} <- setupTestParties
+  mainAccountCreator <- submitMulti [admin, mainUser] [] do
+    createCmd MarbleWebsiteService with admin; user = mainUser
+  let seed = 42
+  (prng, mainAccount) <- submit mainUser do
+    exerciseCmd mainAccountCreator CreateAccount with
+      userName = "xXalice_speedmarbleXx"; prng = defaultPrng seed
+  (prng', otherAccounts) <- createAccounts
+    prng
+    admin
+    (zip otherUsers ["BobNewbie", "KakaMarbler", "__dani_marbles__"])
+  pure TestScenario with
+    testParties = TestParties with
+      admin
+      mainUser = PartyDetails mainUser mainAccount mainAccountCreator
+      otherUsers = otherAccounts
+    prng = prng'
+
+-- Sets up a race called "Super Marble Kart" and inserts all accounts in the
+-- test scenario to participate.
+setupRace : TestScenario PartyDetails -> Script (ContractId Race)
+setupRace TestScenario{..} = do
+  foldl
+    (\raceA partyDetails -> do
+      raceId <- raceA
+      acc <- queryContractId @Account testParties.admin partyDetails.accId
+        >>= \case
+          None -> fail "Got empty account"
+          Some acc -> pure acc
+      submit testParties.admin do
+        exerciseCmd raceId AddToRace with userName = acc.userName; raceName)
+    (submit testParties.admin do
+      createCmd Race with admin = testParties.admin; raceName; racers = [])
+    (testParties.mainUser :: testParties.otherUsers)
+ where
+  raceName = "Super Marble Kart"
+
+-- Used to setup the Navigator. Creates users 1 through 4, as well as the admin.
+-- Sets up accounts 2 to 4, but not account 1, which is yet to be setup in the
+-- Navigator. Sets up a race called "Navigator Racer" and inserts accounts 2 to
+-- 4 to join. Account 1 should be added to the race through the Navigator.
+setupUsers : Script () = do
+  TestParties{..} <- setupTestParties
+
+  adminId <- validateUserId "Admin"
+  createUser (User adminId (Some admin)) [CanActAs admin]
+
+  let users = mainUser :: otherUsers
+  userIds <- mapA (validateUserId . ("User" <>) . show) [1 .. length users]
+  _race <- foldl
+    (\raceA (userId, user, i) -> do
+      -- Map users to parties and create their website services.
+      createUser (User userId (Some user)) [CanActAs user]
+      accCreator <- submitMulti [admin, user] [] do
+        createCmd MarbleWebsiteService with admin; user
+
+      -- For all other users, we assume their accounts were already created, so
+      -- we don't need to recreate all of the in the Navigator. So we just need
+      -- to create user1.
+      if i == 1
+      then raceA  -- User 1 should join manually in the Navigator.
+      else do
+        (_prng, accId) <- submit user do
+          exerciseCmd accCreator CreateAccount with
+            userName = "user" <> show i; prng = defaultPrng i
+        acc <- queryContractId @Account admin accId >>= \case
+          None -> fail "Got empty account"
+          Some acc -> pure acc
+
+        -- Make all other users join a race too (except user 1).
+        raceId <- raceA
+        submit admin do
+          exerciseCmd raceId AddToRace with userName = acc.userName; raceName)
+    (submit admin $ createCmd Race with admin; raceName; racers = [])
+    (zip3 userIds users [1 .. length users])
+  pure ()
+ where
+  raceName = "Navigator Racer"

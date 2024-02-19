@@ -1,0 +1,88 @@
+module Test where
+
+import Main
+import Setup
+
+import DA.List (head)
+import Daml.Script
+
+-- Happy path 1
+canCreateAccounts : Script () = do
+  TestScenario{} <- setupAccountsAndPrng
+  pure ()
+
+-- Unhappy path 1
+cannotCreateDuplicateAccount : Script () = do
+  TestScenario{testParties = TestParties{..}, prng} <- setupAccountsAndPrng
+  accountCreator <- submitMulti [admin, mainUser.party] [] do
+    createCmd MarbleWebsiteService with admin; user = mainUser.party
+  -- User name already in use
+  submitMultiMustFail [mainUser.party] [admin] do
+    exerciseCmd accountCreator CreateAccount with userName = "BobNewbie"; prng
+  pure ()
+
+-- Unhappy path 2
+cannotCreateInvaliduserName : Script () = do
+  TestScenario{testParties = TestParties{..}, prng} <- setupAccountsAndPrng
+  accountCreator <- submitMulti [admin, mainUser.party] [] do
+    createCmd MarbleWebsiteService with admin = admin; user = mainUser.party
+  -- User name cannot be empty
+  submitMustFail mainUser.party do
+    exerciseCmd accountCreator CreateAccount with userName = ""; prng
+  -- User name can only contain numbers, letters, dashes, or underscores
+  submitMustFail mainUser.party do
+    exerciseCmd accountCreator CreateAccount with userName = "space bar"; prng
+  pure ()
+
+-- Happy path 2
+canCreateAndWinARace : Script () = do
+  testScenario@TestScenario{testParties = TestParties{..}, prng} <-
+    setupAccountsAndPrng
+  race <- setupRace testScenario
+  submit admin $ exerciseCmd race StartRace with prng
+  pure ()
+
+-- Happy path 3
+canCreateAndAbortARace : Script () = do
+  testScenario@TestScenario{testParties = TestParties{..}, prng} <-
+    setupAccountsAndPrng
+  race <- setupRace testScenario
+  submit admin $ exerciseCmd race AbortRace
+  pure ()
+
+-- Unhappy path 3
+cannotStartARaceWithMissingUsers : Script () = do
+  testScenario@TestScenario{testParties = TestParties{..}, prng} <-
+    setupAccountsAndPrng
+  let numParticipants = 2
+  assertMsg
+    "Test should setup less than the minimum required number of participants"
+    (numParticipants < minRaceParticipants)
+  race <-
+    setupRace testScenario with
+      testParties.otherUsers =
+        take (numParticipants - 1) testScenario.testParties.otherUsers
+  -- You cannot start a race that has less than 3 participants
+  submitMustFail admin $ exerciseCmd race StartRace with prng
+
+-- Happy path 4
+canLookAtAnotherUser'sProfile : Script () = do
+  testScenario@TestScenario{testParties = TestParties{..}, prng} <-
+    setupAccountsAndPrng
+  race <- setupRace testScenario
+  (_prng, winnerId) <- submit admin $ exerciseCmd race StartRace with prng
+  winner <- queryContractId @Account admin winnerId >>= \case
+    None -> fail "Could not query contract ID for winner"
+    Some winner -> pure winner
+  viewer <- queryContractId @Account admin mainUser.accId >>= \case
+    None ->
+      -- The winner is the main account, so let's pick another.
+      queryContractId @Account admin (head otherUsers).accId >>= \case
+        None -> fail "Could not get account"
+        Some viewer -> pure viewer
+    Some acc -> pure acc
+  (userName, marbles) <- submitMulti [(head otherUsers).party] [winner.user] do
+    exerciseCmd winnerId ViewProfile with viewer
+  debug userName
+  debug marbles
+  pure ()

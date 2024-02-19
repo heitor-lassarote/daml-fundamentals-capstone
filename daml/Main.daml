@@ -1,0 +1,168 @@
+module Main where
+
+import DA.List ((!!))
+import DA.Optional (isNone)
+import DA.Text qualified as Text
+
+import PseudoRandom
+
+-- Defines the color of a marble ball.
+-- Invariant: 0 <= red, green, blue <= 255.
+data Color = Color with
+  red, green, blue : Int
+    deriving (Eq, Show)
+
+instance Random Color where
+  next prng =
+    let nextInt8 prng = fmap (% 256) (next prng) in
+    let (prng',   red)   = nextInt8 prng   in
+    let (prng'',  green) = nextInt8 prng'  in
+    let (prng''', blue)  = nextInt8 prng'' in
+    (prng''', Color{..})
+
+-- https://en.wikipedia.org/wiki/Marble_(toy)
+data Marble = Marble with
+  color : Color
+    deriving (Eq, Show)
+
+instance Random Marble where
+  next prng =
+    let (prng', color) = next prng in
+    (prng', Marble{..})
+
+defaultNewMarblesCount : Int
+defaultNewMarblesCount = 3
+
+-- Template allowing to create an account for a marble owner and assign a
+-- default number of random marbles on creation.
+template Account
+  with
+    admin : Party  -- Website admin.
+    user : Party  -- Party representing the new user registering.
+    userName : Text  -- This user's name.
+    marbles : [Marble]  -- All the marbles owned by this user.
+  where
+    signatory admin, user
+
+    key (admin, userName) : (Party, Text)
+    maintainer key._1
+
+    -- The site administrator can give a random marble to an user.
+    choice GiveMarble : (Prng, ContractId Account)
+      with
+        prng : Prng
+
+      controller admin
+
+      do
+        let (prng', marble) = next prng
+        newAcc <- create this with marbles = marble :: marbles
+        return (prng', newAcc)
+
+    -- A user can view another user's profile.
+    nonconsuming choice ViewProfile : (Text, [Marble])
+      with
+        viewer : Account
+
+      controller viewer.user
+
+      do
+        return (userName, marbles)
+
+minRaceParticipants : Int
+minRaceParticipants = 3
+
+-- Admin can create marble races and add other users to it.
+template Race
+  with
+    admin : Party  -- Website admin.
+    raceName : Text  -- A name describing this race.
+    racers : [Account]  -- Users participating in this race.
+  where
+    signatory admin
+    observer map (.user) racers
+
+    key (admin, raceName) : (Party, Text)
+    maintainer key._1
+
+    ensure raceName /= ""
+
+    -- Admin can add a user to participate in the race.
+    choice AddToRace : ContractId Race
+      with
+        userName : Text
+        raceName : Text
+
+      controller admin
+
+      do
+        assertMsg
+          "You cannot join a race you're already in"
+          (userName `notElem` map (.userName) this.racers)
+        lookupByKey @Account (admin, userName) >>= \case
+          None -> fail "Account not found"
+          Some accId -> do
+            newRacer <- fetch @Account accId
+            create this with racers = newRacer :: this.racers
+
+    -- The race's winner receives a new random marble.
+    choice StartRace : (Prng, ContractId Account)
+      with
+        prng : Prng
+
+      controller admin
+
+      do
+        assertMsg
+          ("You cannot start a race that has less than "
+            <> show minRaceParticipants
+            <> " participants")
+          (length racers >= minRaceParticipants)
+        let (prng', winnerIdx) = next prng
+        let winner = racers !! (winnerIdx % length racers)
+        debug $ "The winner is " <> winner.userName
+        winnerId <- lookupByKey @Account (admin, winner.userName)
+        case winnerId of
+          None -> fail "Internal error: Account does not exist"
+          Some winnerId -> exercise winnerId GiveMarble with prng = prng'
+
+    -- Archives this contract.
+    choice AbortRace : ()
+      with
+
+      controller admin
+
+      do
+        return ()
+
+-- An interface that the user can use to register a new account. It is permitted
+-- that a party can have more than one account.
+template MarbleWebsiteService
+  with
+    admin : Party  -- Website admin.
+    user : Party  -- User of this service.
+  where
+    signatory admin
+    observer user
+
+    -- Allows the user to set a user name and submit it.
+    nonconsuming choice CreateAccount : (Prng, ContractId Account)
+      with
+        userName : Text
+        prng : Prng  -- FIXME: Annoying to pass a PRNG around all the time...
+
+      controller user
+
+      do
+        assertMsg "User name cannot be empty" (userName /= "")
+        assertMsg
+          "User name can only contain numbers, letters, dashes, or underscores"
+          (Text.isPred
+            (\c -> Text.isAlphaNum c || c == "-" || c == "_")
+            userName)
+        userIdOpt <- lookupByKey @Account (admin, userName)
+        assertMsg "User name already in use" (isNone userIdOpt)
+        case nextMany prng defaultNewMarblesCount of
+          None -> fail "Cannot create user with no marbles"
+          Some (prng', marbles) ->
+            fmap (prng', ) (create Account with admin; user; userName; marbles)
